@@ -702,7 +702,8 @@ export default function App() {
   const [hoveredNode, setHoveredNode] = useState(null);
 
   // Circle tool
-  const [fdCircleR, setFdCircleR] = useState(0.1);
+  const [drawTool, setDrawTool] = useState('polygon'); // 'polygon' | 'circle' | 'rect'
+  const [toolState, setToolState] = useState(null); // tool-specific intermediate state
 
   const canvasRef = useRef(null);
 
@@ -895,6 +896,53 @@ export default function App() {
       });
     }
 
+    // Live tool preview for circle / rect
+    if (activeMode === 'freedraw' && mousePos && toolState) {
+      const color = fdTarget === 'outer' ? '#3b82f6' : '#ef4444';
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      if (drawTool === 'circle') {
+        const r = Math.hypot(mousePos[0] - toolState.center[0], mousePos[1] - toolState.center[1]);
+        const rPx = Math.max(1, r * effectiveScale);
+        ctx.beginPath();
+        ctx.arc(toX(toolState.center[0]), toY(toolState.center[1]), rPx, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(toX(toolState.center[0]), toY(toolState.center[1]), 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = color + '88';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(toX(toolState.center[0]), toY(toolState.center[1]));
+        ctx.lineTo(toX(mousePos[0]), toY(mousePos[1]));
+        ctx.stroke();
+        ctx.fillStyle = '#1e293b';
+        ctx.font = 'bold 11px monospace';
+        ctx.fillText(`R = ${r.toFixed(4)}m`, toX(mousePos[0]) + 10, toY(mousePos[1]) - 8);
+      } else if (drawTool === 'rect') {
+        const rx1 = Math.min(toX(toolState.corner1[0]), toX(mousePos[0]));
+        const ry1 = Math.min(toY(toolState.corner1[1]), toY(mousePos[1]));
+        const rw = Math.abs(toX(mousePos[0]) - toX(toolState.corner1[0]));
+        const rh = Math.abs(toY(mousePos[1]) - toY(toolState.corner1[1]));
+        ctx.strokeRect(rx1, ry1, rw, rh);
+        ctx.setLineDash([]);
+        ctx.fillStyle = color + '18';
+        ctx.fillRect(rx1, ry1, rw, rh);
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(toX(toolState.corner1[0]), toY(toolState.corner1[1]), 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#1e293b';
+        ctx.font = 'bold 11px monospace';
+        const wDim = Math.abs(mousePos[0] - toolState.corner1[0]);
+        const hDim = Math.abs(mousePos[1] - toolState.corner1[1]);
+        ctx.fillText(`${wDim.toFixed(4)} × ${hDim.toFixed(4)}m`, toX(mousePos[0]) + 10, toY(mousePos[1]) - 8);
+      }
+    }
+
     if (activeMode === 'freedraw' && mousePos) {
       ctx.font = 'bold 12px monospace';
       let text = `(${mousePos[0].toFixed(2)}, ${mousePos[1].toFixed(2)})`;
@@ -917,7 +965,7 @@ export default function App() {
       ctx.fillStyle = '#0f172a';
       ctx.fillText(text, px, py - 2);
     }
-  }, [geometry, results, activeMode, fdCurrent, mousePos, fdTarget, zoom, panOffset, hoveredNode, dragInfo, fdOuters, fdHoles]);
+  }, [geometry, results, activeMode, fdCurrent, mousePos, fdTarget, zoom, panOffset, hoveredNode, dragInfo, fdOuters, fdHoles, toolState, drawTool]);
 
   const getRawPxPos = (e) => {
     const canvas = canvasRef.current;
@@ -970,6 +1018,17 @@ export default function App() {
     return null;
   };
 
+  const commitShape = (pts) => {
+    if (fdTarget === 'outer') {
+      if (!isOuterValid(pts, fdOuters)) { setFdError("Shape overlaps or touches an existing boundary."); return; }
+      setFdOuters(prev => [...prev, pts]);
+    } else {
+      if (!isHoleValid(pts, fdOuters, fdHoles)) { setFdError("Hole must be strictly inside an outer boundary."); return; }
+      setFdHoles(prev => [...prev, pts]);
+    }
+    setFdError("");
+  };
+
   const handlePointerDown = (e) => {
     if (e.button === 1) {
       panStartRef.current = { x: e.clientX, y: e.clientY, pan: [...panOffset] };
@@ -982,8 +1041,31 @@ export default function App() {
     if (activeMode === 'freedraw') {
       const hit = findHitNode(getRawPxPos(e));
       if (hit) { setDragInfo(hit); return; }
+      const pos = getCanvasMousePos(e);
       setFdError("");
-      setFdCurrent(prev => [...prev, getCanvasMousePos(e)]);
+      if (drawTool === 'circle') {
+        if (!toolState) {
+          setToolState({ center: pos });
+        } else {
+          const r = Math.hypot(pos[0] - toolState.center[0], pos[1] - toolState.center[1]);
+          if (r < 0.001) { setFdError("Circle radius too small."); setToolState(null); return; }
+          commitShape(generateCircle(r, 48).map(([x, y]) => [x + toolState.center[0], y + toolState.center[1]]));
+          setToolState(null);
+        }
+      } else if (drawTool === 'rect') {
+        if (!toolState) {
+          setToolState({ corner1: pos });
+        } else {
+          const c1 = toolState.corner1;
+          if (Math.abs(pos[0]-c1[0]) < 0.001 || Math.abs(pos[1]-c1[1]) < 0.001) {
+            setFdError("Rectangle is too small."); setToolState(null); return;
+          }
+          commitShape([[c1[0],c1[1]], [pos[0],c1[1]], [pos[0],pos[1]], [c1[0],pos[1]]]);
+          setToolState(null);
+        }
+      } else {
+        setFdCurrent(prev => [...prev, pos]);
+      }
     }
   };
 
@@ -1018,7 +1100,9 @@ export default function App() {
 
   const closePolygon = (e) => {
     e.preventDefault();
-    if (activeMode !== 'freedraw' || fdCurrent.length < 3) return;
+    if (activeMode !== 'freedraw') return;
+    if (drawTool !== 'polygon') { setToolState(null); return; }
+    if (fdCurrent.length < 3) return;
     commitPolygon();
   };
 
@@ -1279,44 +1363,72 @@ export default function App() {
                 </div>
 
                 <div className="pt-4 border-t border-slate-100 space-y-3">
-                  <p className="text-xs font-bold text-slate-500 uppercase tracking-wide">Add Circle</p>
-                  <div className="flex gap-2 items-center">
-                    <div className="flex-1 flex items-center gap-1 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
-                      <label className="text-xs text-slate-500 whitespace-nowrap">R =</label>
-                      <input
-                        type="number" min="0.005" max="2" step="0.005" value={fdCircleR}
-                        onChange={e => setFdCircleR(parseFloat(e.target.value) || 0.1)}
-                        className="w-full bg-transparent border-none text-right font-mono text-xs font-bold text-blue-600 focus:outline-none"
-                      />
-                      <span className="text-xs text-slate-400">m</span>
-                    </div>
+                  <p className="text-xs font-bold text-slate-500 uppercase tracking-wide">Draw Tool</p>
+                  <div className="grid grid-cols-3 gap-2">
                     <button
-                      onClick={handleAddCircle}
-                      id="add-circle-btn"
-                      className="flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-violet-100 hover:bg-violet-200 text-violet-700 font-bold text-sm transition-colors"
-                      title="Add circle at crosshair position (move cursor on canvas first)"
+                      id="tool-polygon-btn"
+                      onClick={() => { setDrawTool('polygon'); setToolState(null); setFdCurrent([]); }}
+                      className={`p-3 rounded-xl border-2 flex flex-col items-center gap-1.5 text-xs font-bold transition-all ${drawTool === 'polygon' ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-100 hover:border-slate-200 text-slate-500'}`}
                     >
-                      ◯ Add
+                      <PenTool size={16} /> Polygon
+                    </button>
+                    <button
+                      id="tool-circle-btn"
+                      onClick={() => { setDrawTool('circle'); setToolState(null); setFdCurrent([]); }}
+                      className={`p-3 rounded-xl border-2 flex flex-col items-center gap-1.5 text-xs font-bold transition-all ${drawTool === 'circle' ? 'border-violet-500 bg-violet-50 text-violet-700' : 'border-slate-100 hover:border-slate-200 text-slate-500'}`}
+                    >
+                      <span className="text-base leading-none">◯</span> Circle
+                    </button>
+                    <button
+                      id="tool-rect-btn"
+                      onClick={() => { setDrawTool('rect'); setToolState(null); setFdCurrent([]); }}
+                      className={`p-3 rounded-xl border-2 flex flex-col items-center gap-1.5 text-xs font-bold transition-all ${drawTool === 'rect' ? 'border-amber-500 bg-amber-50 text-amber-700' : 'border-slate-100 hover:border-slate-200 text-slate-500'}`}
+                    >
+                      <Box size={16} /> Rect
                     </button>
                   </div>
-                  <p className="text-[10px] text-slate-400 leading-relaxed">Position cursor on canvas, then click Add. Circle centroid = crosshair position. Respects Boundary / Hole mode.</p>
+                  {drawTool === 'polygon' && !toolState && (
+                    <p className="text-[10px] text-slate-400 leading-relaxed">Click canvas to place vertices. Right-click or press Finish to close shape.</p>
+                  )}
+                  {drawTool === 'circle' && (
+                    <p className={`text-[10px] leading-relaxed font-medium ${toolState ? 'text-violet-600' : 'text-slate-400'}`}>
+                      {toolState ? '● Center set — move cursor to grow radius, click to confirm.' : 'Click canvas to place circle center.'}
+                    </p>
+                  )}
+                  {drawTool === 'rect' && (
+                    <p className={`text-[10px] leading-relaxed font-medium ${toolState ? 'text-amber-600' : 'text-slate-400'}`}>
+                      {toolState ? '■ Corner set — move cursor to size rectangle, click to confirm.' : 'Click canvas to place first corner.'}
+                    </p>
+                  )}
                 </div>
 
                 <div className="pt-4 border-t border-slate-100 grid grid-cols-2 gap-2">
-                  <button
-                    onClick={commitPolygon}
-                    disabled={fdCurrent.length < 3}
-                    className="flex items-center justify-center gap-2 p-3 rounded-xl bg-green-100 hover:bg-green-200 disabled:bg-slate-100 disabled:text-slate-400 text-green-700 font-bold transition-colors"
-                  >
-                    <CheckCircle size={16} /> Finish Shape
-                  </button>
-                  <button
-                    onClick={() => setFdCurrent(prev => prev.slice(0, -1))}
-                    disabled={fdCurrent.length === 0}
-                    className="flex items-center justify-center gap-2 p-3 rounded-xl bg-slate-100 hover:bg-slate-200 disabled:text-slate-300 text-slate-600 font-bold transition-colors"
-                  >
-                    <Undo2 size={16} /> Undo Point
-                  </button>
+                  {drawTool === 'polygon' && (
+                    <>
+                    <button
+                      onClick={commitPolygon}
+                      disabled={fdCurrent.length < 3}
+                      className="flex items-center justify-center gap-2 p-3 rounded-xl bg-green-100 hover:bg-green-200 disabled:bg-slate-100 disabled:text-slate-400 text-green-700 font-bold transition-colors"
+                    >
+                      <CheckCircle size={16} /> Finish Shape
+                    </button>
+                    <button
+                      onClick={() => setFdCurrent(prev => prev.slice(0, -1))}
+                      disabled={fdCurrent.length === 0}
+                      className="flex items-center justify-center gap-2 p-3 rounded-xl bg-slate-100 hover:bg-slate-200 disabled:text-slate-300 text-slate-600 font-bold transition-colors"
+                    >
+                      <Undo2 size={16} /> Undo Point
+                    </button>
+                    </>
+                  )}
+                  {(drawTool === 'circle' || drawTool === 'rect') && toolState && (
+                    <button
+                      onClick={() => setToolState(null)}
+                      className="col-span-2 flex items-center justify-center gap-2 p-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold transition-colors"
+                    >
+                      <Undo2 size={16} /> Cancel
+                    </button>
+                  )}
                   <button
                     onClick={() => { setFdOuters([]); setFdHoles([]); setFdCurrent([]); setFdError(""); setTorsionData(null); }}
                     className="col-span-2 flex items-center justify-center gap-2 p-3 rounded-xl bg-red-50 hover:bg-red-100 text-red-600 font-bold transition-colors"
