@@ -790,14 +790,39 @@ export default function App() {
     const toX = (x) => W / 2 + (x - cx) * effectiveScale + panOffset[0];
     const toY = (y) => H / 2 - (y - cy) * effectiveScale + panOffset[1];
 
-    if (activeMode === 'freedraw') {
-      ctx.strokeStyle = '#e2e8f0';
-      ctx.lineWidth = 1;
-      for (let i = -10; i <= 10; i += 1) {
-        ctx.beginPath(); ctx.moveTo(toX(i * 0.1), 0); ctx.lineTo(toX(i * 0.1), H); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(0, toY(i * 0.1)); ctx.lineTo(W, toY(i * 0.1)); ctx.stroke();
+    // --- Full-canvas adaptive grid (shown in both modes) ---
+    {
+      // Compute visible world bounds from canvas edges
+      const worldXMin = cx + (-W / 2 - panOffset[0]) / effectiveScale;
+      const worldXMax = cx + ( W / 2 - panOffset[0]) / effectiveScale;
+      const worldYMax = cy + ( H / 2 + panOffset[1]) / effectiveScale; // screen top → world max Y
+      const worldYMin = cy - ( H / 2 - panOffset[1]) / effectiveScale; // screen bot → world min Y
+
+      // Adaptive spacing: target ~50px between lines
+      const rawSpacing = 50 / effectiveScale;
+      const mag = Math.pow(10, Math.floor(Math.log10(Math.max(rawSpacing, 1e-10))));
+      const norm = rawSpacing / mag;
+      const gridStep = norm < 1.5 ? mag : norm < 3.5 ? 2 * mag : norm < 7.5 ? 5 * mag : 10 * mag;
+
+      const xStart = Math.floor(worldXMin / gridStep) * gridStep;
+      const yStart = Math.floor(worldYMin / gridStep) * gridStep;
+
+      // Minor grid lines
+      ctx.strokeStyle = '#e8edf5';
+      ctx.lineWidth = 0.75;
+      ctx.setLineDash([]);
+      for (let x = xStart; x <= worldXMax + gridStep; x += gridStep) {
+        const px = toX(x);
+        ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, H); ctx.stroke();
       }
+      for (let y = yStart; y <= worldYMax + gridStep; y += gridStep) {
+        const py = toY(y);
+        ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(W, py); ctx.stroke();
+      }
+
+      // Axes
       ctx.strokeStyle = '#94a3b8';
+      ctx.lineWidth = 1.5;
       ctx.beginPath(); ctx.moveTo(toX(0), 0); ctx.lineTo(toX(0), H); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(0, toY(0)); ctx.lineTo(W, toY(0)); ctx.stroke();
     }
