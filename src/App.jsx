@@ -690,6 +690,20 @@ export default function App() {
   const [torsionData, setTorsionData] = useState(null);
   const [isSolvingTorsion, setIsSolvingTorsion] = useState(false);
 
+  // Zoom / Pan
+  const [zoom, setZoom] = useState(1);
+  const [panOffset, setPanOffset] = useState([0, 0]);
+  const [isPanMode, setIsPanMode] = useState(false);
+  const panStartRef = useRef(null);
+  const canvasTransformRef = useRef({ scale: 1, cx: 0, cy: 0 });
+
+  // Node dragging
+  const [dragInfo, setDragInfo] = useState(null); // {type:'outer'|'hole', pi, ni}
+  const [hoveredNode, setHoveredNode] = useState(null);
+
+  // Circle tool
+  const [fdCircleR, setFdCircleR] = useState(0.1);
+
   const canvasRef = useRef(null);
 
   const params = useMemo(() => {
@@ -765,12 +779,15 @@ export default function App() {
     }
 
     const maxDim = Math.max(maxX - minX, maxY - minY, 0.1);
-    const scale = (Math.min(W, H) * 0.8) / maxDim;
+    const baseScale = (Math.min(W, H) * 0.8) / maxDim;
+    const effectiveScale = baseScale * zoom;
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
 
-    const toX = (x) => W / 2 + (x - cx) * scale;
-    const toY = (y) => H / 2 - (y - cy) * scale;
+    canvasTransformRef.current = { scale: effectiveScale, cx, cy };
+
+    const toX = (x) => W / 2 + (x - cx) * effectiveScale + panOffset[0];
+    const toY = (y) => H / 2 - (y - cy) * effectiveScale + panOffset[1];
 
     if (activeMode === 'freedraw') {
       ctx.strokeStyle = '#e2e8f0';
@@ -839,6 +856,28 @@ export default function App() {
       ctx.setLineDash([]);
     }
 
+    // Draw draggable nodes for committed polygons
+    if (activeMode === 'freedraw') {
+      const drawNodes = (polys, baseColor) => {
+        polys.forEach((poly, pi) => {
+          poly.forEach((pt, ni) => {
+            const isHov = hoveredNode && hoveredNode.type === baseColor && hoveredNode.pi === pi && hoveredNode.ni === ni;
+            const isDrag = dragInfo && dragInfo.type === baseColor && dragInfo.pi === pi && dragInfo.ni === ni;
+            const color = baseColor === 'outer' ? '#2563eb' : '#dc2626';
+            ctx.beginPath();
+            ctx.arc(toX(pt[0]), toY(pt[1]), isDrag ? 7 : isHov ? 6 : 4, 0, Math.PI * 2);
+            ctx.fillStyle = isDrag ? '#f59e0b' : isHov ? '#ffffff' : color;
+            ctx.fill();
+            ctx.strokeStyle = isDrag ? '#d97706' : color;
+            ctx.lineWidth = isDrag ? 2.5 : isHov ? 2.5 : 1;
+            ctx.stroke();
+          });
+        });
+      };
+      drawNodes(fdOuters, 'outer');
+      drawNodes(fdHoles, 'hole');
+    }
+
     if (activeMode === 'freedraw' && fdCurrent.length > 0) {
       ctx.strokeStyle = fdTarget === 'outer' ? '#3b82f6' : '#ef4444';
       ctx.lineWidth = 2;
@@ -878,26 +917,34 @@ export default function App() {
       ctx.fillStyle = '#0f172a';
       ctx.fillText(text, px, py - 2);
     }
-  }, [geometry, results, activeMode, fdCurrent, mousePos, fdTarget]);
+  }, [geometry, results, activeMode, fdCurrent, mousePos, fdTarget, zoom, panOffset, hoveredNode, dragInfo, fdOuters, fdHoles]);
 
-  const getCanvasMousePos = (e) => {
+  const getRawPxPos = (e) => {
     const canvas = canvasRef.current;
     if (!canvas) return [0, 0];
     const rect = canvas.getBoundingClientRect();
     const W = canvas.width, H = canvas.height;
+    return [(e.clientX - rect.left) / rect.width * W, (e.clientY - rect.top) / rect.height * H];
+  };
 
-    const cssX = e.clientX - rect.left;
-    const cssY = e.clientY - rect.top;
-    const x = (cssX / rect.width) * W;
-    const y = (cssY / rect.height) * H;
+  const worldToPx = (wx, wy) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return [0, 0];
+    const W = canvas.width, H = canvas.height;
+    const { scale, cx, cy } = canvasTransformRef.current;
+    return [W / 2 + (wx - cx) * scale + panOffset[0], H / 2 - (wy - cy) * scale + panOffset[1]];
+  };
 
-    const scale = (Math.min(W, H) * 0.8) / 2;
-    let wx = (x - W / 2) / scale;
-    let wy = -(y - H / 2) / scale;
-
+  const getCanvasMousePos = (e) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return [0, 0];
+    const [px, py] = getRawPxPos(e);
+    const W = canvas.width, H = canvas.height;
+    const { scale, cx, cy } = canvasTransformRef.current;
+    let wx = (px - W / 2 - panOffset[0]) / scale + cx;
+    let wy = -((py - H / 2 - panOffset[1]) / scale) + cy;
     let snappedX = Math.round(wx * 20) / 20;
     let snappedY = Math.round(wy * 20) / 20;
-
     if (activeMode === 'freedraw' && fdCurrent.length > 0) {
       const lastPt = fdCurrent[fdCurrent.length - 1];
       const dx = Math.abs(snappedX - lastPt[0]);
@@ -908,19 +955,65 @@ export default function App() {
     return [snappedX, snappedY];
   };
 
-  const handleCanvasClick = (e) => {
-    if (activeMode !== 'freedraw') return;
-
-    // Prevent right-click or other non-primary mouse buttons from adding points
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
-
-    setFdError("");
-    setFdCurrent(prev => [...prev, getCanvasMousePos(e)]);
+  const findHitNode = (pxPos) => {
+    const HIT = 10;
+    for (let pi = 0; pi < fdOuters.length; pi++)
+      for (let ni = 0; ni < fdOuters[pi].length; ni++) {
+        const [nx, ny] = worldToPx(fdOuters[pi][ni][0], fdOuters[pi][ni][1]);
+        if (Math.hypot(pxPos[0] - nx, pxPos[1] - ny) < HIT) return { type: 'outer', pi, ni };
+      }
+    for (let pi = 0; pi < fdHoles.length; pi++)
+      for (let ni = 0; ni < fdHoles[pi].length; ni++) {
+        const [nx, ny] = worldToPx(fdHoles[pi][ni][0], fdHoles[pi][ni][1]);
+        if (Math.hypot(pxPos[0] - nx, pxPos[1] - ny) < HIT) return { type: 'hole', pi, ni };
+      }
+    return null;
   };
 
-  const handleCanvasMove = (e) => {
+  const handlePointerDown = (e) => {
+    if (e.button === 1) {
+      panStartRef.current = { x: e.clientX, y: e.clientY, pan: [...panOffset] };
+      e.preventDefault(); return;
+    }
+    if (e.button !== 0) return;
+    if (isPanMode) {
+      panStartRef.current = { x: e.clientX, y: e.clientY, pan: [...panOffset] }; return;
+    }
+    if (activeMode === 'freedraw') {
+      const hit = findHitNode(getRawPxPos(e));
+      if (hit) { setDragInfo(hit); return; }
+      setFdError("");
+      setFdCurrent(prev => [...prev, getCanvasMousePos(e)]);
+    }
+  };
+
+  const handlePointerMove = (e) => {
+    if (panStartRef.current) {
+      const dx = e.clientX - panStartRef.current.x;
+      const dy = e.clientY - panStartRef.current.y;
+      setPanOffset([panStartRef.current.pan[0] + dx, panStartRef.current.pan[1] + dy]);
+      return;
+    }
+    if (dragInfo) {
+      const newPos = getCanvasMousePos(e);
+      if (dragInfo.type === 'outer')
+        setFdOuters(prev => prev.map((poly, pi) =>
+          pi === dragInfo.pi ? poly.map((pt, ni) => ni === dragInfo.ni ? newPos : pt) : poly));
+      else
+        setFdHoles(prev => prev.map((poly, pi) =>
+          pi === dragInfo.pi ? poly.map((pt, ni) => ni === dragInfo.ni ? newPos : pt) : poly));
+      return;
+    }
     if (activeMode !== 'freedraw') return;
+    setHoveredNode(findHitNode(getRawPxPos(e)) || null);
     setMousePos(getCanvasMousePos(e));
+  };
+
+  const handlePointerUp = () => { panStartRef.current = null; setDragInfo(null); };
+
+  const handleWheel = (e) => {
+    e.preventDefault();
+    setZoom(z => Math.max(0.1, Math.min(20, z * (e.deltaY < 0 ? 1.15 : 1 / 1.15))));
   };
 
   const closePolygon = (e) => {
@@ -933,26 +1026,36 @@ export default function App() {
     if (fdCurrent.length < 3) return;
     if (!isSimplePolygon(fdCurrent)) {
       setFdError("Polygon intersects itself or has zero-length edges. Shape discarded.");
-      setFdCurrent([]);
-      return;
+      setFdCurrent([]); return;
     }
     if (fdTarget === 'outer') {
       if (!isOuterValid(fdCurrent, fdOuters)) {
         setFdError("Outer boundaries cannot overlap, touch boundaries, or intersect each other.");
-        setFdCurrent([]);
-        return;
+        setFdCurrent([]); return;
       }
       setFdOuters(prev => [...prev, fdCurrent]);
     } else {
       if (!isHoleValid(fdCurrent, fdOuters, fdHoles)) {
         setFdError("Holes must be entirely strictly inside an outer boundary and cannot touch or overlap each other.");
-        setFdCurrent([]);
-        return;
+        setFdCurrent([]); return;
       }
       setFdHoles(prev => [...prev, fdCurrent]);
     }
-    setFdCurrent([]);
-    setMousePos(null);
+    setFdCurrent([]); setMousePos(null);
+  };
+
+  const handleAddCircle = () => {
+    const center = mousePos || [0, 0];
+    const r = Math.max(0.005, fdCircleR);
+    const circle = generateCircle(r, 48).map(([x, y]) => [x + center[0], y + center[1]]);
+    if (fdTarget === 'outer') {
+      if (!isOuterValid(circle, fdOuters)) { setFdError("Circle overlaps or touches an existing boundary."); return; }
+      setFdOuters(prev => [...prev, circle]);
+    } else {
+      if (!isHoleValid(circle, fdOuters, fdHoles)) { setFdError("Circle hole must be strictly inside an outer boundary."); return; }
+      setFdHoles(prev => [...prev, circle]);
+    }
+    setFdError("");
   };
 
   const handleParamInput = (key, val) => {
@@ -1175,6 +1278,30 @@ export default function App() {
                   </button>
                 </div>
 
+                <div className="pt-4 border-t border-slate-100 space-y-3">
+                  <p className="text-xs font-bold text-slate-500 uppercase tracking-wide">Add Circle</p>
+                  <div className="flex gap-2 items-center">
+                    <div className="flex-1 flex items-center gap-1 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+                      <label className="text-xs text-slate-500 whitespace-nowrap">R =</label>
+                      <input
+                        type="number" min="0.005" max="2" step="0.005" value={fdCircleR}
+                        onChange={e => setFdCircleR(parseFloat(e.target.value) || 0.1)}
+                        className="w-full bg-transparent border-none text-right font-mono text-xs font-bold text-blue-600 focus:outline-none"
+                      />
+                      <span className="text-xs text-slate-400">m</span>
+                    </div>
+                    <button
+                      onClick={handleAddCircle}
+                      id="add-circle-btn"
+                      className="flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-violet-100 hover:bg-violet-200 text-violet-700 font-bold text-sm transition-colors"
+                      title="Add circle at crosshair position (move cursor on canvas first)"
+                    >
+                      ◯ Add
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-slate-400 leading-relaxed">Position cursor on canvas, then click Add. Circle centroid = crosshair position. Respects Boundary / Hole mode.</p>
+                </div>
+
                 <div className="pt-4 border-t border-slate-100 grid grid-cols-2 gap-2">
                   <button
                     onClick={commitPolygon}
@@ -1203,21 +1330,32 @@ export default function App() {
 
           <main className="lg:col-span-8 space-y-6">
             <div className="bg-white rounded-3xl shadow-sm border border-slate-200/60 overflow-hidden flex flex-col min-h-[450px]">
-              <div className="p-4 bg-slate-50/50 border-b border-slate-100 flex justify-between items-center">
+              <div className="p-4 bg-slate-50/50 border-b border-slate-100 flex flex-wrap gap-y-2 justify-between items-center">
                 <span className="text-sm font-bold flex items-center gap-2 text-slate-700"><Maximize size={16} /> Interactive Canvas</span>
-                <div className="flex gap-4 text-xs font-bold text-slate-400">
-                  <span className="flex items-center gap-1"><div className="w-2 h-2 rounded-full bg-blue-500"></div> Solid</span>
-                  <span className="flex items-center gap-1"><div className="w-2 h-2 rounded-full bg-red-500"></div> Void</span>
-                  <span className="flex items-center gap-1"><div className="w-2 h-2 rounded-full bg-green-500"></div> Centroid</span>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <div className="flex gap-3 text-xs font-bold text-slate-400">
+                    <span className="flex items-center gap-1"><div className="w-2 h-2 rounded-full bg-blue-500"></div> Solid</span>
+                    <span className="flex items-center gap-1"><div className="w-2 h-2 rounded-full bg-red-500"></div> Void</span>
+                    <span className="flex items-center gap-1"><div className="w-2 h-2 rounded-full bg-green-500"></div> Centroid</span>
+                  </div>
+                  <div className="flex gap-1 pl-3 border-l border-slate-200">
+                    <button id="zoom-in-btn" onClick={() => setZoom(z => Math.min(20, z * 1.25))} title="Zoom In" className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-slate-100 text-slate-600 font-black text-lg">+</button>
+                    <button id="zoom-out-btn" onClick={() => setZoom(z => Math.max(0.1, z / 1.25))} title="Zoom Out" className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-slate-100 text-slate-600 font-black text-lg">−</button>
+                    <button id="zoom-reset-btn" onClick={() => { setZoom(1); setPanOffset([0, 0]); }} title="Reset View" className="px-2 h-8 flex items-center justify-center rounded-lg hover:bg-slate-100 text-slate-500 font-bold text-xs">Reset</button>
+                    <button id="pan-mode-btn" onClick={() => setIsPanMode(p => !p)} title="Pan Mode" className={`px-2 h-8 flex items-center justify-center rounded-lg font-bold text-xs transition-colors ${isPanMode ? 'bg-blue-100 text-blue-700 ring-1 ring-blue-300' : 'hover:bg-slate-100 text-slate-500'}`}>Pan</button>
+                    <span className="text-xs text-slate-400 self-center font-mono pl-1">{Math.round(zoom * 100)}%</span>
+                  </div>
                 </div>
               </div>
               <div
-                className={`flex-1 flex items-center justify-center bg-[#fafafa] relative ${activeMode === 'freedraw' ? 'cursor-crosshair' : ''}`}
+                className={`flex-1 flex items-center justify-center bg-[#fafafa] relative ${isPanMode ? 'cursor-grab' : activeMode === 'freedraw' ? (hoveredNode ? 'cursor-move' : 'cursor-crosshair') : ''}`}
                 style={{ touchAction: 'none' }}
-                onPointerMove={handleCanvasMove}
-                onPointerDown={handleCanvasClick}
+                onPointerMove={handlePointerMove}
+                onPointerDown={handlePointerDown}
+                onPointerUp={handlePointerUp}
                 onContextMenu={closePolygon}
-                onPointerLeave={() => setMousePos(null)}
+                onPointerLeave={() => { setMousePos(null); setHoveredNode(null); }}
+                onWheel={handleWheel}
               >
                 <canvas ref={canvasRef} width={800} height={600} className="w-full h-auto max-w-full" />
               </div>
